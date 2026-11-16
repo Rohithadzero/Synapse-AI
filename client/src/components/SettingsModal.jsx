@@ -18,20 +18,13 @@ import {
 } from 'lucide-react';
 import { getSettings, saveSettings, getModels, testConnection } from '../services/api';
 
-const GROQ_MODELS = [
-  { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3 70B Versatile' },
-  { id: 'llama-3.1-8b-instant', name: 'Llama 3.1 8B Instant' },
-  { id: 'gemma2-9b-it', name: 'Gemma 2 9B IT' },
-  { id: 'mixtral-8x7b-32768', name: 'Mixtral 8x7B' },
-  { id: 'llama-3.1-70b-versatile', name: 'Llama 3.1 70B Versatile' },
-];
-
 export default function SettingsModal({ isOpen, onClose, onSettingsChange }) {
   const [provider, setProvider] = useState('local');
   const [apiKey, setApiKey] = useState('');
   const [model, setModel] = useState('');
   const [showKey, setShowKey] = useState(false);
   const [localModels, setLocalModels] = useState([]);
+  const [groqModels, setGroqModels] = useState([]);
   const [testStatus, setTestStatus] = useState(null); // null | 'testing' | 'success' | 'error'
   const [testMessage, setTestMessage] = useState('');
 
@@ -45,6 +38,7 @@ export default function SettingsModal({ isOpen, onClose, onSettingsChange }) {
       setTestStatus(null);
       setTestMessage('');
       loadLocalModels();
+      loadGroqModels(saved.apiKey || '');
     }
   }, [isOpen]);
 
@@ -58,6 +52,16 @@ export default function SettingsModal({ isOpen, onClose, onSettingsChange }) {
     }
   };
 
+  // Load Groq models — the live list when a key is available, otherwise the server's fallback list
+  const loadGroqModels = async (key) => {
+    try {
+      const res = await getModels('groq', key);
+      setGroqModels(res.data || []);
+    } catch {
+      setGroqModels([]);
+    }
+  };
+
   // Test connection
   const handleTest = async () => {
     setTestStatus('testing');
@@ -66,7 +70,8 @@ export default function SettingsModal({ isOpen, onClose, onSettingsChange }) {
       const res = await testConnection(provider, apiKey);
       if (res.data?.online) {
         setTestStatus('success');
-        setTestMessage(`Connected successfully${provider === 'local' ? ` — ${res.data.models?.length || 0} models available` : ''}`);
+        setTestMessage(`Connected successfully — ${res.data.models?.length || 0} models available`);
+        if (provider === 'groq' && res.data.models?.length) setGroqModels(res.data.models);
       } else {
         setTestStatus('error');
         setTestMessage(res.data?.error || 'Connection failed');
@@ -87,7 +92,7 @@ export default function SettingsModal({ isOpen, onClose, onSettingsChange }) {
 
   if (!isOpen) return null;
 
-  const currentModels = provider === 'local' ? localModels : GROQ_MODELS;
+  const currentModels = provider === 'local' ? localModels : groqModels;
 
   return (
     <div className="settings-overlay" onClick={onClose}>

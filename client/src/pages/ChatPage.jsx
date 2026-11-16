@@ -140,7 +140,7 @@ export default function ChatPage() {
           ...prev,
           {
             role: 'assistant',
-            content: `Error: ${err.message}. Make sure Ollama is running.`,
+            content: `Error: ${err.message}`,
           },
         ]);
       }

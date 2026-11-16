@@ -4,144 +4,119 @@
 // based on per-request options passed via headers
 // ============================================================
 
-import { checkOllamaStatus, generateResponse as ollamaGenerate, streamChat as ollamaStreamChat } from './ollamaService.js';
+import {
+  checkOllamaStatus,
+  generateResponse as ollamaGenerate,
+  openChatStream as ollamaOpenChatStream,
+} from './ollamaService.js';
+import { readLines, pipeTokensToSSE, throwUpstreamError } from './streamUtils.js';
 
 const GROQ_API_BASE = 'https://api.groq.com/openai/v1';
+const GROQ_DEFAULT_MODEL = 'llama-3.3-70b-versatile';
 
-// ── Available Groq models ──────────────────────────────────
-const GROQ_MODELS = [
-  { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3 70B Versatile', context: 131072 },
-  { id: 'llama-3.1-8b-instant', name: 'Llama 3.1 8B Instant', context: 131072 },
-  { id: 'gemma2-9b-it', name: 'Gemma 2 9B IT', context: 8192 },
-  { id: 'mixtral-8x7b-32768', name: 'Mixtral 8x7B', context: 32768 },
-  { id: 'llama-3.1-70b-versatile', name: 'Llama 3.1 70B Versatile', context: 131072 },
+// Used only when the live model list can't be fetched (no key / network error)
+const GROQ_FALLBACK_MODELS = [
+  { id: 'llama-3.3-70b-versatile', name: 'llama-3.3-70b-versatile', context: 131072 },
+  { id: 'llama-3.1-8b-instant', name: 'llama-3.1-8b-instant', context: 131072 },
 ];
 
+// Groq also hosts speech, TTS and moderation models — hide those from the chat model picker
+const NON_CHAT_MODEL = /whisper|tts|playai|guard|orpheus|prompt-guard/i;
+
+function groqHeaders(apiKey) {
+  return {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${apiKey}`,
+  };
+}
+
+async function groqFetch(path, options) {
+  try {
+    return await fetch(`${GROQ_API_BASE}${path}`, options);
+  } catch (err) {
+    if (err.name === 'AbortError') throw err;
+    const e = new Error(`Cannot reach Groq API: ${err.message}`);
+    e.statusCode = 503;
+    throw e;
+  }
+}
+
+function requireGroqKey(apiKey) {
+  if (!apiKey) {
+    const err = new Error('Groq API key is required. Add it in Settings.');
+    err.statusCode = 400;
+    throw err;
+  }
+}
+
 // ── Groq: non-streaming generate ────────────────────────────
-async function groqGenerate(prompt, systemPrompt, apiKey, model = 'llama-3.3-70b-versatile') {
+async function groqGenerate(prompt, systemPrompt, apiKey, model, { signal } = {}) {
   const messages = [];
   if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
   messages.push({ role: 'user', content: prompt });
 
-  const res = await fetch(`${GROQ_API_BASE}/chat/completions`, {
+  const res = await groqFetch('/chat/completions', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages,
-      temperature: 0.7,
-      max_tokens: 4096,
-      stream: false,
-    }),
+    headers: groqHeaders(apiKey),
+    body: JSON.stringify({ model, messages, temperature: 0.7, max_tokens: 4096, stream: false }),
+    signal,
   });
 
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: { message: `HTTP ${res.status}` } }));
-    throw new Error(`Groq API error: ${err.error?.message || res.status}`);
-  }
+  if (!res.ok) await throwUpstreamError(res, 'Groq API');
 
   const data = await res.json();
-  return data.choices[0]?.message?.content || '';
+  return data.choices?.[0]?.message?.content || '';
 }
 
 // ── Groq: streaming chat ────────────────────────────────────
-async function groqStreamChat(messages, expressRes, apiKey, model = 'llama-3.3-70b-versatile') {
-  const res = await fetch(`${GROQ_API_BASE}/chat/completions`, {
+async function groqOpenChatStream(messages, apiKey, model, { signal } = {}) {
+  const res = await groqFetch('/chat/completions', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages,
-      temperature: 0.7,
-      max_tokens: 4096,
-      stream: true,
-    }),
+    headers: groqHeaders(apiKey),
+    body: JSON.stringify({ model, messages, temperature: 0.7, max_tokens: 4096, stream: true }),
+    signal,
   });
 
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: { message: `HTTP ${res.status}` } }));
-    throw new Error(`Groq API error: ${err.error?.message || res.status}`);
-  }
+  if (!res.ok) await throwUpstreamError(res, 'Groq API');
 
-  // Set up SSE headers
-  expressRes.setHeader('Content-Type', 'text/event-stream');
-  expressRes.setHeader('Cache-Control', 'no-cache');
-  expressRes.setHeader('Connection', 'keep-alive');
-  expressRes.setHeader('X-Accel-Buffering', 'no');
-
-  let fullResponse = '';
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-
-  try {
-    let buffer = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop(); // Keep the incomplete line in buffer
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith('data: ')) continue;
-
-        const data = trimmed.slice(6);
-        if (data === '[DONE]') {
-          expressRes.write(`data: ${JSON.stringify({ token: '', done: true, fullResponse })}\n\n`);
-          continue;
-        }
-
-        try {
-          const parsed = JSON.parse(data);
-          const content = parsed.choices?.[0]?.delta?.content;
-          if (content) {
-            fullResponse += content;
-            expressRes.write(`data: ${JSON.stringify({ token: content, done: false })}\n\n`);
-          }
-        } catch (parseErr) {
-          // Skip malformed lines
-        }
+  return (async function* tokens() {
+    // OpenAI-compatible SSE: "data: {...}" lines, terminated by "data: [DONE]"
+    for await (const line of readLines(res.body)) {
+      if (!line.startsWith('data:')) continue;
+      const data = line.slice(5).trim();
+      if (data === '[DONE]') return;
+      let parsed;
+      try {
+        parsed = JSON.parse(data);
+      } catch {
+        continue; // skip malformed lines
       }
+      if (parsed.error) throw new Error(`Groq API error: ${parsed.error.message || parsed.error}`);
+      const content = parsed.choices?.[0]?.delta?.content;
+      if (content) yield content;
     }
-  } catch (streamErr) {
-    expressRes.write(`data: ${JSON.stringify({ error: streamErr.message })}\n\n`);
-  } finally {
-    expressRes.end();
-  }
+  })();
+}
 
-  return fullResponse;
+// ── Groq: model list ────────────────────────────────────────
+async function fetchGroqModels(apiKey) {
+  const res = await groqFetch('/models', { headers: groqHeaders(apiKey) });
+  if (!res.ok) await throwUpstreamError(res, 'Groq API');
+  const { data = [] } = await res.json();
+  return data
+    .filter((m) => m.active !== false && !NON_CHAT_MODEL.test(m.id))
+    .map((m) => ({ id: m.id, name: m.id, context: m.context_window }))
+    .sort((a, b) => a.id.localeCompare(b.id));
 }
 
 // ── Groq: check status ──────────────────────────────────────
 async function checkGroqStatus(apiKey) {
   try {
-    const res = await fetch(`${GROQ_API_BASE}/models`, {
-      headers: { 'Authorization': `Bearer ${apiKey}` },
-    });
-    if (!res.ok) throw new Error(`Groq API returned ${res.status}`);
-    const data = await res.json();
-    return {
-      online: true,
-      models: GROQ_MODELS,
-      defaultModel: 'llama-3.3-70b-versatile',
-      provider: 'groq',
-    };
+    requireGroqKey(apiKey);
+    const models = await fetchGroqModels(apiKey);
+    return { online: true, models, defaultModel: GROQ_DEFAULT_MODEL, provider: 'groq' };
   } catch (err) {
-    return {
-      online: false,
-      models: [],
-      defaultModel: 'llama-3.3-70b-versatile',
-      provider: 'groq',
-      error: err.message,
-    };
+    return { online: false, models: [], defaultModel: GROQ_DEFAULT_MODEL, provider: 'groq', error: err.message };
   }
 }
 
@@ -163,32 +138,39 @@ export function extractLLMOptions(req) {
 
 /**
  * Non-streaming text generation (summarize, code review, sentiment)
+ * @param {string} prompt
+ * @param {string} systemPrompt
+ * @param {{ provider?: string, apiKey?: string, model?: string, signal?: AbortSignal }} [options]
  */
 export async function generateResponse(prompt, systemPrompt, options = {}) {
-  const { provider = 'local', apiKey, model } = options;
+  const { provider = 'local', apiKey, model, signal } = options;
 
   if (provider === 'groq') {
-    if (!apiKey) throw new Error('Groq API key is required');
-    return groqGenerate(prompt, systemPrompt, apiKey, model || 'llama-3.3-70b-versatile');
+    requireGroqKey(apiKey);
+    return groqGenerate(prompt, systemPrompt, apiKey, model || GROQ_DEFAULT_MODEL, { signal });
   }
 
-  // Default: local Ollama
-  return ollamaGenerate(prompt, systemPrompt, model || undefined);
+  return ollamaGenerate(prompt, systemPrompt, model || undefined, { signal });
 }
 
 /**
- * Streaming chat with message history
+ * Streaming chat with message history, relayed to the client as SSE.
+ * Throws (before any SSE headers are written) if the provider rejects the request,
+ * so callers can still send a normal JSON error response.
+ * @returns {Promise<{ fullResponse: string, completed: boolean, aborted: boolean }>}
  */
 export async function streamChat(messages, res, options = {}) {
-  const { provider = 'local', apiKey, model } = options;
+  const { provider = 'local', apiKey, model, signal } = options;
 
+  let tokens;
   if (provider === 'groq') {
-    if (!apiKey) throw new Error('Groq API key is required');
-    return groqStreamChat(messages, res, apiKey, model || 'llama-3.3-70b-versatile');
+    requireGroqKey(apiKey);
+    tokens = await groqOpenChatStream(messages, apiKey, model || GROQ_DEFAULT_MODEL, { signal });
+  } else {
+    tokens = await ollamaOpenChatStream(messages, model || undefined, { signal });
   }
 
-  // Default: local Ollama
-  return ollamaStreamChat(messages, res, model || undefined);
+  return pipeTokensToSSE(tokens, res, { signal });
 }
 
 /**
@@ -196,21 +178,24 @@ export async function streamChat(messages, res, options = {}) {
  */
 export async function getProviderStatus(options = {}) {
   const { provider = 'local', apiKey } = options;
-
-  if (provider === 'groq') {
-    return checkGroqStatus(apiKey);
-  }
-
+  if (provider === 'groq') return checkGroqStatus(apiKey);
   return checkOllamaStatus();
 }
 
 /**
- * Get available models for a provider
+ * Get available models for a provider.
+ * For Groq, returns the live list when an API key is available, otherwise a small fallback list.
  */
-export function getAvailableModels(provider = 'local') {
+export async function getAvailableModels(provider = 'local', apiKey = '') {
   if (provider === 'groq') {
-    return GROQ_MODELS;
+    if (!apiKey) return GROQ_FALLBACK_MODELS;
+    try {
+      const models = await fetchGroqModels(apiKey);
+      return models.length ? models : GROQ_FALLBACK_MODELS;
+    } catch {
+      return GROQ_FALLBACK_MODELS;
+    }
   }
-  // For local, models come from checkOllamaStatus()
-  return [];
+  const status = await checkOllamaStatus();
+  return status.models.map((m) => ({ id: m.name, name: m.name, size: m.size }));
 }

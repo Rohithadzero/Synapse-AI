@@ -79,20 +79,11 @@ app.get('/api/settings/providers', (req, res) => {
 // Get models for a provider
 app.get('/api/settings/models/:provider', async (req, res) => {
   const { provider } = req.params;
-  if (provider === 'local') {
-    const status = await checkOllamaStatus();
-    return res.json({
-      success: true,
-      data: status.models?.map(m => ({ id: m.name, name: m.name, size: m.size })) || [],
-    });
+  if (provider !== 'local' && provider !== 'groq') {
+    return res.status(400).json({ success: false, error: 'Unknown provider' });
   }
-  if (provider === 'groq') {
-    return res.json({
-      success: true,
-      data: getAvailableModels('groq'),
-    });
-  }
-  res.status(400).json({ success: false, error: 'Unknown provider' });
+  const data = await getAvailableModels(provider, req.llm.apiKey);
+  res.json({ success: true, data });
 });
 
 // Test provider connection

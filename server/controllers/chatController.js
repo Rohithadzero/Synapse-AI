@@ -94,20 +94,42 @@ export async function sendMessage(req, res, next) {
       return res.status(404).json({ success: false, error: 'Conversation not found' });
     }
 
-    // Add user message to history
-    conversation.messages.push({ role: 'user', content: message });
+    const userMessage = { role: 'user', content: message };
 
     // Build messages array (including system prompt)
     const chatMessages = [
       { role: 'system', content: SYSTEM_PROMPT },
       ...conversation.messages,
+      userMessage,
     ];
 
-    // Stream the AI response — uses req.llm options to route to correct provider
-    const fullResponse = await streamChat(chatMessages, res, req.llm);
+    // If the browser disconnects (user pressed Stop / closed the tab),
+    // cancel the upstream LLM request instead of generating into the void
+    const controller = new AbortController();
+    res.on('close', () => {
+      if (!res.writableFinished) controller.abort();
+    });
 
-    // Save assistant response to conversation
-    conversation.messages.push({ role: 'assistant', content: fullResponse });
+    // Stream the AI response — uses req.llm options to route to correct provider.
+    // Provider errors before streaming starts are thrown and become a JSON error response.
+    const { fullResponse, completed, aborted } = await streamChat(chatMessages, res, {
+      ...req.llm,
+      signal: controller.signal,
+    });
+
+    // Persist the exchange only if the model actually produced an answer:
+    // - completed: save as-is
+    // - stopped by the user with partial text: save it, marked as stopped (matches the UI)
+    // - upstream error / empty: save nothing, so the user can simply retry
+    let assistantContent = null;
+    if (completed && fullResponse) {
+      assistantContent = fullResponse;
+    } else if (aborted && fullResponse) {
+      assistantContent = `${fullResponse}\n\n*[Stopped]*`;
+    }
+    if (!assistantContent) return;
+
+    conversation.messages.push(userMessage, { role: 'assistant', content: assistantContent });
 
     // Auto-generate title from first message if it's still default
     if (conversation.title === 'New Conversation' && conversation.messages.length === 2) {

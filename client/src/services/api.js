@@ -4,7 +4,9 @@
 // Includes settings management for provider toggle
 // ============================================================
 
-const BASE_URL = 'http://localhost:5000/api';
+// In dev, Vite proxies /api to the Express server (see vite.config.js).
+// For a separately hosted backend, set VITE_API_URL (e.g. https://api.example.com/api).
+const BASE_URL = import.meta.env.VITE_API_URL || '/api';
 
 // ── Settings (localStorage) ─────────────────────────────────
 const SETTINGS_KEY = 'synapse-ai-settings';
@@ -55,16 +57,11 @@ function getLLMHeaders() {
 async function request(endpoint, options = {}) {
   const url = `${BASE_URL}${endpoint}`;
   const config = {
-    headers: {
-      'Content-Type': 'application/json',
-      ...getLLMHeaders(),       // Inject provider/key/model headers
-      ...options.headers,       // Allow overrides
-    },
     ...options,
     headers: {
       'Content-Type': 'application/json',
-      ...getLLMHeaders(),
-      ...options.headers,
+      ...getLLMHeaders(), // Inject provider/key/model headers
+      ...options.headers, // Allow overrides
     },
   };
 
@@ -84,7 +81,9 @@ export const getHealth = () => request('/health');
 
 // ── Settings ─────────────────────────────────────────────
 export const getProviders = () => request('/settings/providers');
-export const getModels = (provider) => request(`/settings/models/${provider}`);
+// apiKey (optional) overrides the saved key, e.g. a key typed in Settings but not saved yet
+export const getModels = (provider, apiKey) =>
+  request(`/settings/models/${provider}`, apiKey ? { headers: { 'x-api-key': apiKey } } : {});
 export const testConnection = (provider, apiKey) =>
   request('/settings/test', {
     method: 'POST',
@@ -124,36 +123,50 @@ export function sendChatMessage(conversationId, message, onToken, onDone, onErro
     signal: controller.signal,
   })
     .then(async (res) => {
-      if (!res.ok) throw new Error('Stream request failed');
+      if (!res.ok) {
+        // Errors before streaming starts come back as normal JSON
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `Stream request failed (HTTP ${res.status})`);
+      }
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
+      let buffer = '';
+      let finished = false;
 
-      while (true) {
+      while (!finished) {
         const { done, value } = await reader.read();
         if (done) break;
 
-        const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split('\n').filter((l) => l.startsWith('data: '));
+        // A network chunk can end mid-event, so keep the incomplete tail for next time
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
 
         for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          let data;
           try {
-            const data = JSON.parse(line.slice(6));
-            if (data.error) {
-              onError?.(new Error(data.error));
-              return;
-            }
-            if (data.token) {
-              onToken(data.token);
-            }
-            if (data.done) {
-              onDone?.(data.fullResponse);
-            }
-          } catch (e) {
-            // Skip parse errors
+            data = JSON.parse(line.slice(6));
+          } catch {
+            continue; // skip malformed events
+          }
+          if (data.error) {
+            onError?.(new Error(data.error));
+            finished = true;
+            break;
+          }
+          if (data.token) onToken(data.token);
+          if (data.done) {
+            onDone?.(data.fullResponse);
+            finished = true;
+            break;
           }
         }
       }
+
+      if (!finished) onError?.(new Error('Connection closed before the response finished'));
+      reader.cancel().catch(() => {});
     })
     .catch((err) => {
       if (err.name !== 'AbortError') {
